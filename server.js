@@ -4,9 +4,10 @@ import { verifySlackRequest } from "./lib/slack-verify.js";
 import {
   appendLogEntry,
   createDatabaseRow,
+  writeRowPageBody,
   normalizeTag,
 } from "./lib/notion.js";
-import { generateTitle } from "./lib/ai.js";
+import { generateTitleAndSummary } from "./lib/ai.js";
 
 const TAG_OPTIONS = [
   "💡 New idea",
@@ -55,33 +56,51 @@ function assertSlackSignature(req, res) {
 }
 
 /**
+ * Format a Date into ET display strings for Notion.
+ * @param {Date} date
  * @returns {{ dateDisplay: string; timeDisplay: string; dateIso: string }}
  */
-function easternNow() {
-  const now = new Date();
+function formatEastern(date) {
   const dateDisplay = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     weekday: "short",
     year: "numeric",
     month: "short",
     day: "numeric",
-  }).format(now);
+  }).format(date);
 
   const timeDisplay = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "numeric",
     minute: "2-digit",
     hour12: true,
-  }).format(now);
+  }).format(date);
 
   const dateIso = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(now);
+  }).format(date);
 
   return { dateDisplay, timeDisplay, dateIso };
+}
+
+/**
+ * Resolve the best timestamp to use:
+ * - message.ts (Slack Unix timestamp) when available (message shortcut)
+ * - current time as fallback (global shortcut)
+ * @param {string | null | undefined} slackTs  e.g. "1743720491.123456"
+ * @returns {{ dateDisplay: string; timeDisplay: string; dateIso: string }}
+ */
+function resolveTimestamp(slackTs) {
+  if (slackTs && typeof slackTs === "string") {
+    const ms = parseFloat(slackTs) * 1000;
+    if (Number.isFinite(ms) && ms > 0) {
+      return formatEastern(new Date(ms));
+    }
+  }
+  return formatEastern(new Date());
 }
 
 /**
@@ -114,9 +133,9 @@ function resolveSlackMessageUrl(payload) {
 
 /**
  * @param {object} shortcutPayload Slack shortcut payload (global or message)
- * @param {string | null} [aiTitle] AI-generated title to pre-fill (overrides first-line fallback)
+ * @param {{ title: string | null; summary: string | null }} [ai]
  */
-function buildModalView(shortcutPayload, aiTitle = null) {
+function buildModalView(shortcutPayload, ai = { title: null, summary: null }) {
   const channel = shortcutPayload.channel;
   const channelName =
     channel && typeof channel.name === "string" && channel.name.length > 0
@@ -125,11 +144,14 @@ function buildModalView(shortcutPayload, aiTitle = null) {
   const channelId = channel?.id ?? null;
 
   const slackMessageUrl = resolveSlackMessageUrl(shortcutPayload);
+  const messageTs = shortcutPayload.message?.ts ?? null;
 
   const meta = JSON.stringify({
     channelId,
     channelName,
     slackMessageUrl: slackMessageUrl || null,
+    messageTs: messageTs || null,
+    aiSummary: ai.summary || null,
   });
 
   const message = shortcutPayload.message;
@@ -144,8 +166,8 @@ function buildModalView(shortcutPayload, aiTitle = null) {
       : "";
 
     if (raw.length > 0) {
-      if (aiTitle) {
-        initialTitle = aiTitle.slice(0, SLACK_MODAL_TITLE_MAX);
+      if (ai.title) {
+        initialTitle = ai.title.slice(0, SLACK_MODAL_TITLE_MAX);
       } else {
         const firstLine =
           raw.split(/\n/).find((l) => l.trim().length > 0)?.trim() || "";
@@ -288,20 +310,20 @@ app.post("/slack/actions", async (req, res) => {
       return;
     }
 
-    // For message shortcuts, try to generate a title with Claude.
-    // Falls back to first-line title if API key is missing, slow, or errors.
-    let aiTitle = null;
+    // For message shortcuts, generate title + summary with Claude in one call.
+    // Falls back gracefully if API key is missing, slow, or errors.
+    let ai = { title: null, summary: null };
     if (payload.type === "message_action") {
       const rawText = payload.message?.text;
       if (rawText && typeof rawText === "string" && rawText.trim().length > 0) {
-        aiTitle = await generateTitle(rawText);
+        ai = await generateTitleAndSummary(rawText);
       }
     }
 
     try {
       await slack.views.open({
         trigger_id: triggerId,
-        view: buildModalView(payload, aiTitle),
+        view: buildModalView(payload, ai),
       });
     } catch (err) {
       console.error("[vision-log] views.open failed:", err);
@@ -320,18 +342,20 @@ app.post("/slack/actions", async (req, res) => {
 
     const values = payload.view.state.values;
     const title = values?.title_block?.title?.value?.trim() || "";
-    const summary = values?.summary_block?.summary?.value?.trim() || "";
+    const summaryRaw = values?.summary_block?.summary?.value?.trim() || "";
     const tagRaw =
       values?.tag_block?.tag?.selected_option?.value || TAG_OPTIONS[0];
     const tag = normalizeTag(tagRaw);
 
-    let meta = { channelId: null, channelName: null, slackMessageUrl: null };
+    let meta = { channelId: null, channelName: null, slackMessageUrl: null, messageTs: null, aiSummary: null };
     try {
       if (payload.view.private_metadata) {
         meta = {
           channelId: null,
           channelName: null,
           slackMessageUrl: null,
+          messageTs: null,
+          aiSummary: null,
           ...JSON.parse(payload.view.private_metadata),
         };
       }
@@ -339,11 +363,29 @@ app.post("/slack/actions", async (req, res) => {
       /* keep defaults */
     }
 
+    const aiSummary =
+      typeof meta.aiSummary === "string" && meta.aiSummary.trim().length > 0
+        ? meta.aiSummary.trim()
+        : null;
+
     const slackMessageUrl =
       typeof meta.slackMessageUrl === "string" &&
       meta.slackMessageUrl.startsWith("http")
         ? meta.slackMessageUrl
         : null;
+
+    // Strip the "Slack message (open full thread):\n<url>" line that was
+    // pre-filled into the modal — the 🔗 link block in Notion covers this.
+    const summary = slackMessageUrl
+      ? summaryRaw
+          .replace(
+            new RegExp(
+              `\\s*Slack message \\(open full thread\\):\\n${slackMessageUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`
+            ),
+            ""
+          )
+          .trim()
+      : summaryRaw;
 
     const channelLabel =
       meta.channelName && String(meta.channelName).length > 0
@@ -361,7 +403,7 @@ app.post("/slack/actions", async (req, res) => {
     const userLine = `@${username}`;
     const loggedByForDb = userLine;
 
-    const { dateDisplay, timeDisplay, dateIso } = easternNow();
+    const { dateDisplay, timeDisplay, dateIso } = resolveTimestamp(meta.messageTs);
 
     // Run Notion calls BEFORE responding so Vercel doesn't kill the function
     // early. Slack allows up to 3 seconds for view_submission responses;
@@ -372,7 +414,8 @@ app.post("/slack/actions", async (req, res) => {
       );
     } else {
       await runNotionSafely(async () => {
-        await createDatabaseRow({
+        // 1. Create database row (Summary property = AI summary or fallback)
+        const rowPageId = await createDatabaseRow({
           notionToken,
           databaseId,
           row: {
@@ -381,11 +424,21 @@ app.post("/slack/actions", async (req, res) => {
             tag,
             channel: channelForDb,
             loggedBy: loggedByForDb,
-            summary,
+            aiSummary,
+            fullText: summary,
             slackMessageUrl,
           },
         });
 
+        // 2. Write full message text into the row's own page body
+        await writeRowPageBody({
+          notionToken,
+          rowPageId,
+          fullText: summary,
+          slackMessageUrl,
+        });
+
+        // 3. Append formatted entry to the running log page
         await appendLogEntry({
           notionToken,
           pageId,
@@ -395,7 +448,8 @@ app.post("/slack/actions", async (req, res) => {
             channelLine: channelLabel,
             userLine,
             title,
-            summary,
+            aiSummary,
+            fullText: summary,
             tag,
             slackMessageUrl,
           },
