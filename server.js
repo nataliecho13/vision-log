@@ -6,6 +6,7 @@ import {
   createDatabaseRow,
   normalizeTag,
 } from "./lib/notion.js";
+import { generateTitle } from "./lib/ai.js";
 
 const TAG_OPTIONS = [
   "💡 New idea",
@@ -15,7 +16,13 @@ const TAG_OPTIONS = [
 ];
 
 const MODAL_CALLBACK_ID = "vision_log_modal";
+/** Global shortcut (lightning menu, no message context) */
 const SHORTCUT_CALLBACK_ID = "log_vision";
+/** Message shortcut (“⋯” on a message — pre-fills excerpt from that message) */
+const MESSAGE_SHORTCUT_CALLBACK_ID = "log_vision_message";
+
+const SLACK_MODAL_TEXT_MAX = 3000;
+const SLACK_MODAL_TITLE_MAX = 200;
 
 const app = express();
 
@@ -78,9 +85,38 @@ function easternNow() {
 }
 
 /**
- * @param {object} shortcutPayload
+ * Slack permalink when available, else built from team domain + channel + message ts (for threads / block-only messages).
+ * @param {object} payload Shortcut payload
+ * @returns {string | null}
  */
-function buildModalView(shortcutPayload) {
+function resolveSlackMessageUrl(payload) {
+  const message = payload.message;
+  if (!message || typeof message !== "object") return null;
+
+  if (
+    typeof message.permalink === "string" &&
+    message.permalink.startsWith("http")
+  ) {
+    return message.permalink;
+  }
+
+  const channelId = payload.channel?.id;
+  const ts = message.ts;
+  if (!channelId || ts == null || ts === "") return null;
+
+  const p = String(ts).replace(/\./g, "");
+  const domain = payload.team?.domain;
+  if (domain && typeof domain === "string") {
+    return `https://${domain}.slack.com/archives/${channelId}/p${p}`;
+  }
+  return `https://slack.com/archives/${channelId}/p${p}`;
+}
+
+/**
+ * @param {object} shortcutPayload Slack shortcut payload (global or message)
+ * @param {string | null} [aiTitle] AI-generated title to pre-fill (overrides first-line fallback)
+ */
+function buildModalView(shortcutPayload, aiTitle = null) {
   const channel = shortcutPayload.channel;
   const channelName =
     channel && typeof channel.name === "string" && channel.name.length > 0
@@ -88,10 +124,70 @@ function buildModalView(shortcutPayload) {
       : null;
   const channelId = channel?.id ?? null;
 
+  const slackMessageUrl = resolveSlackMessageUrl(shortcutPayload);
+
   const meta = JSON.stringify({
     channelId,
     channelName,
+    slackMessageUrl: slackMessageUrl || null,
   });
+
+  const message = shortcutPayload.message;
+  let initialTitle = undefined;
+  let initialSummary = undefined;
+
+  if (message && typeof message === "object") {
+    const raw =
+      typeof message.text === "string" ? message.text.trim() : "";
+    const linkLine = slackMessageUrl
+      ? `Slack message (open full thread):\n${slackMessageUrl}`
+      : "";
+
+    if (raw.length > 0) {
+      if (aiTitle) {
+        initialTitle = aiTitle.slice(0, SLACK_MODAL_TITLE_MAX);
+      } else {
+        const firstLine =
+          raw.split(/\n/).find((l) => l.trim().length > 0)?.trim() || "";
+        if (firstLine.length > 0) {
+          initialTitle = firstLine.slice(0, SLACK_MODAL_TITLE_MAX);
+        }
+      }
+      let body = raw;
+      if (linkLine) {
+        body = `${raw}\n\n${linkLine}`;
+      }
+      initialSummary = body.slice(0, SLACK_MODAL_TEXT_MAX);
+    } else if (linkLine) {
+      initialSummary = linkLine.slice(0, SLACK_MODAL_TEXT_MAX);
+      initialTitle = "Slack thread";
+    }
+  }
+
+  const titleInput = {
+    type: "plain_text_input",
+    action_id: "title",
+    placeholder: {
+      type: "plain_text",
+      text: "e.g. Pace of shipping vs. roadmap depth",
+    },
+  };
+  if (initialTitle !== undefined) {
+    titleInput.initial_value = initialTitle;
+  }
+
+  const summaryInput = {
+    type: "plain_text_input",
+    action_id: "summary",
+    multiline: true,
+    placeholder: {
+      type: "plain_text",
+      text: "Paste the conversation or summarize it",
+    },
+  };
+  if (initialSummary !== undefined) {
+    summaryInput.initial_value = initialSummary;
+  }
 
   return {
     type: "modal",
@@ -106,29 +202,14 @@ function buildModalView(shortcutPayload) {
         block_id: "title_block",
         optional: false,
         label: { type: "plain_text", text: "Title" },
-        element: {
-          type: "plain_text_input",
-          action_id: "title",
-          placeholder: {
-            type: "plain_text",
-            text: "e.g. Pace of shipping vs. roadmap depth",
-          },
-        },
+        element: titleInput,
       },
       {
         type: "input",
         block_id: "summary_block",
         optional: false,
         label: { type: "plain_text", text: "Key excerpt or summary" },
-        element: {
-          type: "plain_text_input",
-          action_id: "summary",
-          multiline: true,
-          placeholder: {
-            type: "plain_text",
-            text: "Paste the conversation or summarize it",
-          },
-        },
+        element: summaryInput,
       },
       {
         type: "input",
@@ -194,17 +275,33 @@ app.post("/slack/actions", async (req, res) => {
 
   const slack = new WebClient(botToken);
 
-  if (payload.type === "shortcut" && payload.callback_id === SHORTCUT_CALLBACK_ID) {
+  // Global shortcuts: type === "shortcut"
+  // Message shortcuts: type === "message_action"
+  const isVisionShortcut =
+    (payload.type === "shortcut" && payload.callback_id === SHORTCUT_CALLBACK_ID) ||
+    (payload.type === "message_action" && payload.callback_id === MESSAGE_SHORTCUT_CALLBACK_ID);
+
+  if (isVisionShortcut) {
     const triggerId = payload.trigger_id;
     if (!triggerId) {
       res.status(400).send("Missing trigger_id");
       return;
     }
 
+    // For message shortcuts, try to generate a title with Claude.
+    // Falls back to first-line title if API key is missing, slow, or errors.
+    let aiTitle = null;
+    if (payload.type === "message_action") {
+      const rawText = payload.message?.text;
+      if (rawText && typeof rawText === "string" && rawText.trim().length > 0) {
+        aiTitle = await generateTitle(rawText);
+      }
+    }
+
     try {
       await slack.views.open({
         trigger_id: triggerId,
-        view: buildModalView(payload),
+        view: buildModalView(payload, aiTitle),
       });
     } catch (err) {
       console.error("[vision-log] views.open failed:", err);
@@ -228,14 +325,25 @@ app.post("/slack/actions", async (req, res) => {
       values?.tag_block?.tag?.selected_option?.value || TAG_OPTIONS[0];
     const tag = normalizeTag(tagRaw);
 
-    let meta = { channelId: null, channelName: null };
+    let meta = { channelId: null, channelName: null, slackMessageUrl: null };
     try {
       if (payload.view.private_metadata) {
-        meta = JSON.parse(payload.view.private_metadata);
+        meta = {
+          channelId: null,
+          channelName: null,
+          slackMessageUrl: null,
+          ...JSON.parse(payload.view.private_metadata),
+        };
       }
     } catch {
       /* keep defaults */
     }
+
+    const slackMessageUrl =
+      typeof meta.slackMessageUrl === "string" &&
+      meta.slackMessageUrl.startsWith("http")
+        ? meta.slackMessageUrl
+        : null;
 
     const channelLabel =
       meta.channelName && String(meta.channelName).length > 0
@@ -275,6 +383,7 @@ app.post("/slack/actions", async (req, res) => {
           channel: channelForDb,
           loggedBy: loggedByForDb,
           summary,
+          slackMessageUrl,
         },
       });
 
@@ -289,6 +398,7 @@ app.post("/slack/actions", async (req, res) => {
           title,
           summary,
           tag,
+          slackMessageUrl,
         },
       });
     });

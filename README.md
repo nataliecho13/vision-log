@@ -1,6 +1,6 @@
 # Vision Log
 
-Slack app that opens a **global shortcut** modal to log strategic conversations. Each submission creates a row in a Notion database and appends a formatted block to a Notion page.
+Slack app that opens a modal to log strategic conversations—from the **global shortcut** (anywhere) or a **message shortcut** (⋯ on a specific message, with that message pre-filled). Each submission creates a row in a Notion database and appends a formatted block to a Notion page.
 
 - **Runtime:** Node.js 18+, Express (deployed as one Vercel serverless function)
 - **Endpoint:** `POST /slack/actions` (full URL: `https://<your-deployment>.vercel.app/slack/actions`)
@@ -16,6 +16,7 @@ Set these in the Vercel project (**Settings → Environment Variables**):
 | `NOTION_TOKEN` | Notion integration secret |
 | `NOTION_DATABASE_ID` | Target database ID (32-char hex, no dashes) |
 | `NOTION_PAGE_ID` | Running log page ID (32-char hex, no dashes) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (`sk-ant-...`) — optional; if missing, title falls back to first line of message |
 
 For local development, copy `.env.example` to `.env` and use [Vercel CLI](https://vercel.com/docs/cli) (`vercel env pull`) or paste values manually.
 
@@ -25,10 +26,10 @@ For local development, copy `.env.example` to `.env` and use [Vercel CLI](https:
 2. **Interactivity & Shortcuts**
    - Turn **Interactivity** on.
    - **Request URL:** `https://<your-deployment>.vercel.app/slack/actions` (must respond 200 to Slack’s URL verification challenge if you use Events; this app only uses interactivity payloads, so ensure the URL is reachable).
-3. **Shortcuts**
-   - Add a **Global** shortcut.
-   - **Callback ID:** `log_vision` (must match exactly).
-   - Name/description as you like (e.g. “Log vision”).
+3. **Shortcuts** (add both if you want lightning-menu *and* log-from-a-message)
+   - **Global** shortcut: **Callback ID** `log_vision` (exactly). Name e.g. “Log vision”.
+   - **Message** shortcut: **Callback ID** `log_vision_message` (exactly). Name e.g. “Log this to Vision Log”.  
+     This appears on the **⋯** menu on a message; the modal opens with **Title** and **Key excerpt** pre-filled from that message (and the message link when Slack sends a `permalink`).
 4. **OAuth & Permissions → Bot Token Scopes**  
    Add at least what you listed: `chat:write`, `chat:write.public`.  
    Opening modals from a global shortcut does not require extra scopes beyond a valid bot token and interactivity; add more scopes only if you extend the app (e.g. posting into channels).
@@ -80,7 +81,8 @@ Use the tunnel URL Vercel prints (e.g. `http://localhost:3000`) as the Slack Req
 
 ## Behavior summary
 
-- **Shortcut** `log_vision` → opens a modal with Title, Key excerpt or summary, and Tag (static select).
+- **Global shortcut** `log_vision` → modal (empty fields except you fill them).
+- **Message shortcut** `log_vision_message` → same modal, with **Title** / **Key excerpt** pre-filled from that message; the excerpt includes a **Slack permalink** (or a built URL from channel + timestamp) so you can jump back to the **full thread**. Notion gets a clickable **Open thread in Slack** link in the database **Summary** and on the running log page (even if you trim the excerpt in the modal).
 - **Captured automatically:** channel name when Slack sends it (otherwise treated as a private conversation), submitting user, date/time in **America/New_York**.
 - **On submit:** Slack modal closes immediately (`response_action: clear`). The server then:
   1. Inserts a Notion database row (`Date`, `Title`, `Tag`, `Channel`, `Logged by`, `Summary`).
