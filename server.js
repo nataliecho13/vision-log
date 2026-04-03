@@ -363,46 +363,47 @@ app.post("/slack/actions", async (req, res) => {
 
     const { dateDisplay, timeDisplay, dateIso } = easternNow();
 
+    // Run Notion calls BEFORE responding so Vercel doesn't kill the function
+    // early. Slack allows up to 3 seconds for view_submission responses;
+    // Notion API calls are typically 200–600ms so this is safe.
+    if (!notionToken || !databaseId || !pageId) {
+      console.error(
+        "[vision-log] Missing NOTION_TOKEN, NOTION_DATABASE_ID, or NOTION_PAGE_ID"
+      );
+    } else {
+      await runNotionSafely(async () => {
+        await createDatabaseRow({
+          notionToken,
+          databaseId,
+          row: {
+            dateIso,
+            title,
+            tag,
+            channel: channelForDb,
+            loggedBy: loggedByForDb,
+            summary,
+            slackMessageUrl,
+          },
+        });
+
+        await appendLogEntry({
+          notionToken,
+          pageId,
+          entry: {
+            dateStr: dateDisplay,
+            timeStr: timeDisplay,
+            channelLine: channelLabel,
+            userLine,
+            title,
+            summary,
+            tag,
+            slackMessageUrl,
+          },
+        });
+      });
+    }
+
     res.status(200).json({ response_action: "clear" });
-
-    await runNotionSafely(async () => {
-      if (!notionToken || !databaseId || !pageId) {
-        console.error(
-          "[vision-log] Missing NOTION_TOKEN, NOTION_DATABASE_ID, or NOTION_PAGE_ID"
-        );
-        return;
-      }
-
-      await createDatabaseRow({
-        notionToken,
-        databaseId,
-        row: {
-          dateIso,
-          title,
-          tag,
-          channel: channelForDb,
-          loggedBy: loggedByForDb,
-          summary,
-          slackMessageUrl,
-        },
-      });
-
-      await appendLogEntry({
-        notionToken,
-        pageId,
-        entry: {
-          dateStr: dateDisplay,
-          timeStr: timeDisplay,
-          channelLine: channelLabel,
-          userLine,
-          title,
-          summary,
-          tag,
-          slackMessageUrl,
-        },
-      });
-    });
-
     return;
   }
 
