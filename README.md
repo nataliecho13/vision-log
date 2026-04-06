@@ -36,9 +36,13 @@ For local development, copy `.env.example` to `.env` and use [Vercel CLI](https:
    | Scope | Why |
    |-------|-----|
    | `commands` | Required for shortcuts |
-   | `users:read` | Resolve the original message author's display name for the "Logged by" field |
+   | `chat:write` | Post the confirmation thread reply |
+   | `chat:write.public` | Post in public channels without the bot needing to join them |
+   | `users:read` | Resolve the original message author's display name for the "Sent by" field |
 
-   After adding `users:read`, click **Reinstall to Workspace** so the new scope takes effect. Without this scope, `users.info` will fail silently and the modal submitter's name will be used instead of the message author's.
+   After changing scopes, click **Reinstall to Workspace** so they take effect.
+
+   > **Private channels:** `chat:write.public` only covers public channels. For private channels, invite the bot first: `/invite @your-bot-name`.
 5. **Install to Workspace** and copy the **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
 
 ## Notion setup

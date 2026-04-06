@@ -503,15 +503,35 @@ app.post("/slack/actions", async (req, res) => {
           },
         });
 
-        // 4. Post a confirmation reply in the original thread (message shortcut only)
+        // 4. Confirm: thread reply if possible, DM fallback for private channels
+        const notionDbUrl = `https://www.notion.so/${databaseId.replace(/-/g, "")}`;
+        const confirmText = slackMessageUrl
+          ? `✅ Logged to Vision Log — <${notionDbUrl}|${title || "view entry"}> · <${slackMessageUrl}|jump to message>`
+          : `✅ Logged to Vision Log — <${notionDbUrl}|${title || "view entry"}>`;
+
         if (meta.channelId && meta.messageTs) {
-          const notionPageUrl = `https://www.notion.so/${databaseId.replace(/-/g, "")}`;
+          try {
+            await slack.chat.postMessage({
+              channel: meta.channelId,
+              thread_ts: meta.messageTs,
+              text: confirmText,
+            });
+          } catch {
+            // Channel not accessible (e.g. private) — fall back to DM
+            await slack.chat.postMessage({
+              channel: payload.user.id,
+              text: confirmText,
+            }).catch((err) => {
+              console.error("[vision-log] confirmation failed:", err);
+            });
+          }
+        } else {
+          // Global shortcut — no thread, just DM
           await slack.chat.postMessage({
-            channel: meta.channelId,
-            thread_ts: meta.messageTs,
-            text: `✅ Logged to Vision Log — <${notionPageUrl}|${title || "view entry"}>`,
+            channel: payload.user.id,
+            text: confirmText,
           }).catch((err) => {
-            console.error("[vision-log] thread reply failed:", err);
+            console.error("[vision-log] confirmation failed:", err);
           });
         }
       });
