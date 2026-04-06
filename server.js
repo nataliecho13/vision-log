@@ -134,8 +134,9 @@ function resolveSlackMessageUrl(payload) {
 /**
  * @param {object} shortcutPayload Slack shortcut payload (global or message)
  * @param {{ title: string | null; summary: string | null }} [ai]
+ * @param {string | null} [messageSenderName] Display name of the original message author
  */
-function buildModalView(shortcutPayload, ai = { title: null, summary: null }) {
+function buildModalView(shortcutPayload, ai = { title: null, summary: null }, messageSenderName = null) {
   const channel = shortcutPayload.channel;
   const channelName =
     channel && typeof channel.name === "string" && channel.name.length > 0
@@ -152,6 +153,7 @@ function buildModalView(shortcutPayload, ai = { title: null, summary: null }) {
     slackMessageUrl: slackMessageUrl || null,
     messageTs: messageTs || null,
     aiSummary: ai.summary || null,
+    messageSenderName: messageSenderName || null,
   });
 
   const message = shortcutPayload.message;
@@ -310,20 +312,41 @@ app.post("/slack/actions", async (req, res) => {
       return;
     }
 
-    // For message shortcuts, generate title + summary with Claude in one call.
-    // Falls back gracefully if API key is missing, slow, or errors.
+    // For message shortcuts, generate title + summary with Claude and resolve
+    // the original message sender in parallel.
     let ai = { title: null, summary: null };
+    let messageSenderName = null;
     if (payload.type === "message_action") {
       const rawText = payload.message?.text;
-      if (rawText && typeof rawText === "string" && rawText.trim().length > 0) {
-        ai = await generateTitleAndSummary(rawText);
+      const messageUserId = payload.message?.user;
+
+      const [aiResult, userInfoResult] = await Promise.all([
+        rawText && typeof rawText === "string" && rawText.trim().length > 0
+          ? generateTitleAndSummary(rawText)
+          : Promise.resolve({ title: null, summary: null }),
+        messageUserId
+          ? slack.users.info({ user: messageUserId }).catch((err) => {
+              console.error("[vision-log] users.info failed:", err);
+              return null;
+            })
+          : Promise.resolve(null),
+      ]);
+
+      ai = aiResult;
+      if (userInfoResult?.user) {
+        const profile = userInfoResult.user.profile;
+        messageSenderName =
+          (profile?.display_name && profile.display_name.trim()) ||
+          (profile?.real_name && profile.real_name.trim()) ||
+          userInfoResult.user.name ||
+          null;
       }
     }
 
     try {
       await slack.views.open({
         trigger_id: triggerId,
-        view: buildModalView(payload, ai),
+        view: buildModalView(payload, ai, messageSenderName),
       });
     } catch (err) {
       console.error("[vision-log] views.open failed:", err);
@@ -347,7 +370,7 @@ app.post("/slack/actions", async (req, res) => {
       values?.tag_block?.tag?.selected_option?.value || TAG_OPTIONS[0];
     const tag = normalizeTag(tagRaw);
 
-    let meta = { channelId: null, channelName: null, slackMessageUrl: null, messageTs: null, aiSummary: null };
+    let meta = { channelId: null, channelName: null, slackMessageUrl: null, messageTs: null, aiSummary: null, messageSenderName: null };
     try {
       if (payload.view.private_metadata) {
         meta = {
@@ -356,6 +379,7 @@ app.post("/slack/actions", async (req, res) => {
           slackMessageUrl: null,
           messageTs: null,
           aiSummary: null,
+          messageSenderName: null,
           ...JSON.parse(payload.view.private_metadata),
         };
       }
@@ -394,13 +418,23 @@ app.post("/slack/actions", async (req, res) => {
 
     const channelForDb = channelLabel;
 
-    const user = payload.user || {};
-    const username =
-      (typeof user.username === "string" && user.username) ||
-      (typeof user.name === "string" && user.name) ||
-      user.id ||
-      "unknown";
-    const userLine = `@${username}`;
+    // Use the original message sender when available (message shortcuts);
+    // fall back to the person who submitted the modal (global shortcuts).
+    let userLine;
+    if (
+      typeof meta.messageSenderName === "string" &&
+      meta.messageSenderName.trim().length > 0
+    ) {
+      userLine = `@${meta.messageSenderName.trim()}`;
+    } else {
+      const user = payload.user || {};
+      const username =
+        (typeof user.username === "string" && user.username) ||
+        (typeof user.name === "string" && user.name) ||
+        user.id ||
+        "unknown";
+      userLine = `@${username}`;
+    }
     const loggedByForDb = userLine;
 
     const { dateDisplay, timeDisplay, dateIso } = resolveTimestamp(meta.messageTs);
