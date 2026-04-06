@@ -147,13 +147,15 @@ function buildModalView(shortcutPayload, ai = { title: null, summary: null }, me
   const slackMessageUrl = resolveSlackMessageUrl(shortcutPayload);
   const messageTs = shortcutPayload.message?.ts ?? null;
 
+  // Slack private_metadata is capped at 3000 characters. Keep aiSummary short.
+  const aiSummaryForMeta = ai.summary ? ai.summary.slice(0, 400) : null;
+
   const meta = JSON.stringify({
     channelId,
     channelName,
     slackMessageUrl: slackMessageUrl || null,
     messageTs: messageTs || null,
-    aiSummary: ai.summary || null,
-    messageSenderName: messageSenderName || null,
+    aiSummary: aiSummaryForMeta,
   });
 
   const message = shortcutPayload.message;
@@ -250,6 +252,19 @@ function buildModalView(shortcutPayload, ai = { title: null, summary: null }, me
           })),
         },
       },
+      {
+        type: "input",
+        block_id: "sent_by_block",
+        optional: true,
+        label: { type: "plain_text", text: "Sent by" },
+        hint: { type: "plain_text", text: "Who sent the original message?" },
+        element: {
+          type: "plain_text_input",
+          action_id: "sent_by",
+          placeholder: { type: "plain_text", text: "e.g. Jane Smith" },
+          ...(messageSenderName ? { initial_value: messageSenderName } : {}),
+        },
+      },
     ],
   };
 }
@@ -340,6 +355,13 @@ app.post("/slack/actions", async (req, res) => {
           (profile?.real_name && profile.real_name.trim()) ||
           userInfoResult.user.name ||
           null;
+        console.log(
+          `[vision-log] message sender resolved: userId=${messageUserId} display_name="${profile?.display_name}" real_name="${profile?.real_name}" name="${userInfoResult.user.name}" -> "${messageSenderName}"`
+        );
+      } else {
+        console.log(
+          `[vision-log] message sender NOT resolved: userId=${messageUserId} userInfoResult=${JSON.stringify(userInfoResult)}`
+        );
       }
     }
 
@@ -370,7 +392,7 @@ app.post("/slack/actions", async (req, res) => {
       values?.tag_block?.tag?.selected_option?.value || TAG_OPTIONS[0];
     const tag = normalizeTag(tagRaw);
 
-    let meta = { channelId: null, channelName: null, slackMessageUrl: null, messageTs: null, aiSummary: null, messageSenderName: null };
+    let meta = { channelId: null, channelName: null, slackMessageUrl: null, messageTs: null, aiSummary: null };
     try {
       if (payload.view.private_metadata) {
         meta = {
@@ -379,7 +401,6 @@ app.post("/slack/actions", async (req, res) => {
           slackMessageUrl: null,
           messageTs: null,
           aiSummary: null,
-          messageSenderName: null,
           ...JSON.parse(payload.view.private_metadata),
         };
       }
@@ -418,24 +439,16 @@ app.post("/slack/actions", async (req, res) => {
 
     const channelForDb = channelLabel;
 
-    // Use the original message sender when available (message shortcuts);
-    // fall back to the person who submitted the modal (global shortcuts).
-    let userLine;
-    if (
-      typeof meta.messageSenderName === "string" &&
-      meta.messageSenderName.trim().length > 0
-    ) {
-      userLine = `@${meta.messageSenderName.trim()}`;
-    } else {
-      const user = payload.user || {};
-      const username =
-        (typeof user.username === "string" && user.username) ||
-        (typeof user.name === "string" && user.name) ||
-        user.id ||
-        "unknown";
-      userLine = `@${username}`;
-    }
-    const loggedByForDb = userLine;
+    const sentBy = values?.sent_by_block?.sent_by?.value?.trim() || "";
+
+    const user = payload.user || {};
+    const loggedByUsername =
+      (typeof user.username === "string" && user.username) ||
+      (typeof user.name === "string" && user.name) ||
+      user.id ||
+      "unknown";
+    const loggedByLine = `@${loggedByUsername}`;
+    const loggedByForDb = sentBy ? `@${sentBy}` : loggedByLine;
 
     const { dateDisplay, timeDisplay, dateIso } = resolveTimestamp(meta.messageTs);
 
@@ -480,7 +493,8 @@ app.post("/slack/actions", async (req, res) => {
             dateStr: dateDisplay,
             timeStr: timeDisplay,
             channelLine: channelLabel,
-            userLine,
+            sentBy,
+            loggedByLine,
             title,
             aiSummary,
             fullText: summary,

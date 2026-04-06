@@ -31,8 +31,14 @@ For local development, copy `.env.example` to `.env` and use [Vercel CLI](https:
    - **Message** shortcut: **Callback ID** `log_vision_message` (exactly). Name e.g. “Log this to Vision Log”.  
      This appears on the **⋯** menu on a message; the modal opens with **Title** and **Key excerpt** pre-filled from that message (and the message link when Slack sends a `permalink`).
 4. **OAuth & Permissions → Bot Token Scopes**  
-   Add at least what you listed: `chat:write`, `chat:write.public`.  
-   Opening modals from a global shortcut does not require extra scopes beyond a valid bot token and interactivity; add more scopes only if you extend the app (e.g. posting into channels).
+   Add these scopes:
+
+   | Scope | Why |
+   |-------|-----|
+   | `commands` | Required for shortcuts |
+   | `users:read` | Resolve the original message author's display name for the "Logged by" field |
+
+   After adding `users:read`, click **Reinstall to Workspace** so the new scope takes effect. Without this scope, `users.info` will fail silently and the modal submitter's name will be used instead of the message author's.
 5. **Install to Workspace** and copy the **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
 
 ## Notion setup
@@ -83,7 +89,7 @@ Use the tunnel URL Vercel prints (e.g. `http://localhost:3000`) as the Slack Req
 
 - **Global shortcut** `log_vision` → modal (empty fields except you fill them).
 - **Message shortcut** `log_vision_message` → same modal, with **Title** / **Key excerpt** pre-filled from that message; the excerpt includes a **Slack permalink** (or a built URL from channel + timestamp) so you can jump back to the **full thread**. Notion gets a clickable **Open thread in Slack** link in the database **Summary** and on the running log page (even if you trim the excerpt in the modal).
-- **Captured automatically:** channel name when Slack sends it (otherwise treated as a private conversation), submitting user, date/time in **America/New_York**.
+- **Captured automatically:** channel name when Slack sends it (otherwise treated as a private conversation), date/time in **America/New_York**, and the author of the logged message (requires `users:read` scope; falls back to the submitter for global shortcuts or if the lookup fails).
 - **On submit:** Slack modal closes immediately (`response_action: clear`). The server then:
   1. Inserts a Notion database row (`Date`, `Title`, `Tag`, `Channel`, `Logged by`, `Summary`).
   2. Appends to the log page: a **divider**, then paragraphs for date/time/channel line, user/tag line, **bold** title, and summary.
