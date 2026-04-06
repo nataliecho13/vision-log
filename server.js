@@ -502,6 +502,18 @@ app.post("/slack/actions", async (req, res) => {
             slackMessageUrl,
           },
         });
+
+        // 4. Post a confirmation reply in the original thread (message shortcut only)
+        if (meta.channelId && meta.messageTs) {
+          const notionPageUrl = `https://www.notion.so/${databaseId.replace(/-/g, "")}`;
+          await slack.chat.postMessage({
+            channel: meta.channelId,
+            thread_ts: meta.messageTs,
+            text: `✅ Logged to Vision Log — <${notionPageUrl}|${title || "view entry"}>`,
+          }).catch((err) => {
+            console.error("[vision-log] thread reply failed:", err);
+          });
+        }
       });
     }
 
