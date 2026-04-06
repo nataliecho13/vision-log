@@ -10,10 +10,9 @@ import {
 import { generateTitleAndSummary } from "./lib/ai.js";
 
 const TAG_OPTIONS = [
-  "💡 New idea",
-  "🔁 Recurring theme",
-  "⏸️ Punted",
-  "✅ Became a thing",
+  "🗺️ Strategy",
+  "🔧 Feature",
+  "👥 Team / process",
 ];
 
 const MODAL_CALLBACK_ID = "vision_log_modal";
@@ -433,9 +432,11 @@ app.post("/slack/actions", async (req, res) => {
       : summaryRaw;
 
     const channelLabel =
-      meta.channelName && String(meta.channelName).length > 0
-        ? `#${meta.channelName}`
-        : "private conversation";
+      meta.channelName === "directmessage" || meta.channelName === "mpdirectmessage"
+        ? "direct message"
+        : meta.channelName && String(meta.channelName).length > 0
+          ? `#${meta.channelName}`
+          : "private conversation";
 
     const channelForDb = channelLabel;
 
